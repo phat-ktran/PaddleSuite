@@ -14,7 +14,6 @@
 
 import cv2
 import numpy as np
-from PIL import Image
 
 
 def decode_image(im_file, im_info):

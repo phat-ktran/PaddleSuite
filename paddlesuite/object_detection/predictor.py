@@ -3,7 +3,6 @@ import yaml
 import numpy as np
 import math
 import json
-from tqdm import tqdm
 import paddle
 from dataclasses import dataclass
 
@@ -311,7 +310,6 @@ class ObjectDetector(BasePredictor):
         model_dir,
         device="CPU",
         run_mode="paddle",
-        batch_size=1,
         trt_min_shape=1,
         trt_max_shape=1280,
         trt_opt_shape=640,
@@ -342,7 +340,6 @@ class ObjectDetector(BasePredictor):
             delete_shuffle_pass=delete_shuffle_pass,
         )
         self.det_times = Timer()
-        self.batch_size = batch_size
         self.threshold = threshold
         self.device = device
 
@@ -413,88 +410,77 @@ class ObjectDetector(BasePredictor):
             image_list = data
         if not image_list:
             return
-        
-        # Process batch by batch
-        for i in range(0, len(image_list), self.batch_size):
-            batch = image_list[i : i + self.batch_size]
-            results = self._predict_images(batch)
+
+        for im_path in image_list:
+            results = self._predict_images([im_path])
             for res in results:
                 yield res
 
     def _predict_images(self, image_list):
-        batch_loop_cnt = math.ceil(float(len(image_list)) / self.batch_size)
         results = []
-        for i in tqdm(range(batch_loop_cnt), desc="Running inference"):
-            start_index = i * self.batch_size
-            end_index = min((i + 1) * self.batch_size, len(image_list))
-            batch_image_list = image_list[start_index:end_index]
+        for im_path in image_list:
+            self.det_times.preprocess_time_s.start()
+            inputs_list = self.preprocess([im_path])
+            if not isinstance(inputs_list, list):
+                inputs_list = [inputs_list]
+            self.det_times.preprocess_time_s.end()
 
-            # Since multi-scale handles 1 image at a time effectively,
-            # this loop logic ensures we process each image independently
-            # and map it to an ObjectDetectionResult.
-            for im_path in batch_image_list:
-                self.det_times.preprocess_time_s.start()
-                inputs_list = self.preprocess([im_path])
-                if not isinstance(inputs_list, list):
-                    inputs_list = [inputs_list]
-                self.det_times.preprocess_time_s.end()
+            all_boxes = []
 
-                all_boxes = []
+            for scale_idx, inputs in enumerate(inputs_list):
+                self.det_times.inference_time_s.start()
+                input_names = self.predictor.get_input_names()
+                for j in range(len(input_names)):
+                    input_tensor = self.predictor.get_input_handle(input_names[j])
+                    if input_names[j] == "x":
+                        input_tensor.copy_from_cpu(inputs["image"])
+                    else:
+                        input_tensor.copy_from_cpu(inputs[input_names[j]])
 
-                for scale_idx, inputs in enumerate(inputs_list):
-                    self.det_times.inference_time_s.start()
-                    input_names = self.predictor.get_input_names()
-                    for j in range(len(input_names)):
-                        input_tensor = self.predictor.get_input_handle(input_names[j])
-                        if input_names[j] == "x":
-                            input_tensor.copy_from_cpu(inputs["image"])
-                        else:
-                            input_tensor.copy_from_cpu(inputs[input_names[j]])
+                result = self._predict()
+                self.det_times.inference_time_s.end()
 
-                    result = self._predict()
-                    self.det_times.inference_time_s.end()
+                scale_result = self.postprocess(inputs, result)
+                if (
+                    scale_result.get("boxes") is not None
+                    and len(scale_result["boxes"]) > 0
+                ):
+                    np_boxes = scale_result["boxes"]
+                    if inputs.get("is_flipped", False):
+                        orig_w = (
+                            inputs["im_shape"][0][1] / inputs["scale_factor"][0][1]
+                        )
+                        xmin = orig_w - np_boxes[:, 4]
+                        xmax = orig_w - np_boxes[:, 2]
+                        np_boxes[:, 2] = xmin
+                        np_boxes[:, 4] = xmax
 
-                    scale_result = self.postprocess(inputs, result)
-                    if (
-                        scale_result.get("boxes") is not None
-                        and len(scale_result["boxes"]) > 0
-                    ):
-                        np_boxes = scale_result["boxes"]
-                        if inputs.get("is_flipped", False):
-                            orig_w = (
-                                inputs["im_shape"][0][1] / inputs["scale_factor"][0][1]
-                            )
-                            xmin = orig_w - np_boxes[:, 4]
-                            xmax = orig_w - np_boxes[:, 2]
-                            np_boxes[:, 2] = xmin
-                            np_boxes[:, 4] = xmax
+                    all_boxes.append(np_boxes)
 
-                        all_boxes.append(np_boxes)
-
-                self.det_times.postprocess_time_s.start()
-                if len(all_boxes) > 0:
-                    concatenated_boxes = np.concatenate(all_boxes)
-                    # Pass the number of classes from labels
-                    merged_boxes = multiclass_nms(
-                        concatenated_boxes,
-                        num_classes=len(self.pred_config.labels),
-                        nms_threshold=0.5,
-                    )
-                else:
-                    merged_boxes = np.empty((0, 6), dtype=np.float32)
-
-                self.det_times.postprocess_time_s.end()
-                self.det_times.img_num += 1
-
-                # Create the ObjectDetectionResult
-                det_result = ObjectDetectionResult(
-                    file_name=im_path,
-                    boxes=merged_boxes,
-                    masks=None,  # Masks logic can be added later if needed
-                    labels=self.pred_config.labels,
-                    threshold=self.threshold,
+            self.det_times.postprocess_time_s.start()
+            if len(all_boxes) > 0:
+                concatenated_boxes = np.concatenate(all_boxes)
+                # Pass the number of classes from labels
+                merged_boxes = multiclass_nms(
+                    concatenated_boxes,
+                    num_classes=len(self.pred_config.labels),
+                    nms_threshold=0.5,
                 )
+            else:
+                merged_boxes = np.empty((0, 6), dtype=np.float32)
 
-                results.append(det_result)
+            self.det_times.postprocess_time_s.end()
+            self.det_times.img_num += 1
+
+            # Create the ObjectDetectionResult
+            det_result = ObjectDetectionResult(
+                file_name=im_path,
+                boxes=merged_boxes,
+                masks=None,  # Masks logic can be added later if needed
+                labels=self.pred_config.labels,
+                threshold=self.threshold,
+            )
+
+            results.append(det_result)
 
         return results
