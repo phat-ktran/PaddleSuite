@@ -326,7 +326,7 @@ class ObjectDetector(BasePredictor):
             model_dir,
             self.pred_config.arch,
             run_mode=run_mode,
-            batch_size=batch_size,
+            batch_size=1,
             min_subgraph_size=self.pred_config.min_subgraph_size,
             device=device,
             use_dynamic_shape=self.pred_config.use_dynamic_shape,

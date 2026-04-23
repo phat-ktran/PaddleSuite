@@ -96,7 +96,7 @@ wheels = [
 [[package]]
 name = "paddlesuite"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "numpy" },
     { name = "opencv-python" },
@@ -108,12 +108,12 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "numpy", specifier = ">=2.4.4" },
-    { name = "opencv-python", specifier = ">=4.13.0.92" },
-    { name = "pillow", specifier = ">=12.2.0" },
-    { name = "pyyaml", specifier = ">=6.0.3" },
-    { name = "setuptools", specifier = ">=82.0.1" },
-    { name = "tqdm", specifier = ">=4.67.3" },
+    { name = "numpy" },
+    { name = "opencv-python" },
+    { name = "pillow" },
+    { name = "pyyaml" },
+    { name = "setuptools" },
+    { name = "tqdm" },
 ]
 
 [[package]]
