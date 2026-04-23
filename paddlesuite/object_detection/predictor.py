@@ -22,65 +22,7 @@ from .preprocess import (
 )
 from .utils import Timer
 from .visualize import visualize_box_mask
-
-
-@dataclass
-class ObjectDetectionResult:
-    file_name: str
-    boxes: np.ndarray
-    masks: np.ndarray
-    labels: list
-    threshold: float
-
-    def save_to_json(self, dir_path):
-        os.makedirs(dir_path, exist_ok=True)
-        img_name = os.path.basename(self.file_name)
-        json_name = os.path.splitext(img_name)[0] + ".json"
-        out_path = os.path.join(dir_path, json_name)
-
-        bbox_results = []
-        if self.boxes is not None and len(self.boxes) > 0:
-            for box in self.boxes:
-                # filter by threshold
-                if box[1] < self.threshold:
-                    continue
-                bbox_results.append(
-                    {
-                        "image_id": json_name,
-                        "category_id": int(box[0]),
-                        "file_name": img_name,
-                        # xyxy -> xywh
-                        "bbox": [
-                            float(box[2]),
-                            float(box[3]),
-                            float(box[4] - box[2]),
-                            float(box[5] - box[3]),
-                        ],
-                        "score": float(box[1]),
-                    }
-                )
-
-        with open(out_path, "w") as f:
-            json.dump(bbox_results, f, indent=4)
-        print(f"Saved JSON result to: {out_path}")
-
-    def save_to_img(self, dir_path):
-        os.makedirs(dir_path, exist_ok=True)
-        img_name = os.path.basename(self.file_name)
-        out_path = os.path.join(dir_path, img_name)
-
-        im_results = {}
-        if self.boxes is not None:
-            im_results["boxes"] = self.boxes
-        if self.masks is not None:
-            im_results["masks"] = self.masks
-
-        im = visualize_box_mask(
-            self.file_name, im_results, self.labels, threshold=self.threshold
-        )
-
-        im.save(out_path, quality=95)
-        print("Saved Image result to: " + out_path)
+from .result import ObjectDetectorResult
 
 
 def compute_iou(box1, boxes):
@@ -304,6 +246,7 @@ def get_files(path):
 
 from paddlesuite.base import BasePredictor
 
+
 class ObjectDetector(BasePredictor):
     def __init__(
         self,
@@ -447,9 +390,7 @@ class ObjectDetector(BasePredictor):
                 ):
                     np_boxes = scale_result["boxes"]
                     if inputs.get("is_flipped", False):
-                        orig_w = (
-                            inputs["im_shape"][0][1] / inputs["scale_factor"][0][1]
-                        )
+                        orig_w = inputs["im_shape"][0][1] / inputs["scale_factor"][0][1]
                         xmin = orig_w - np_boxes[:, 4]
                         xmax = orig_w - np_boxes[:, 2]
                         np_boxes[:, 2] = xmin
@@ -472,11 +413,10 @@ class ObjectDetector(BasePredictor):
             self.det_times.postprocess_time_s.end()
             self.det_times.img_num += 1
 
-            # Create the ObjectDetectionResult
-            det_result = ObjectDetectionResult(
+            # Create the ObjectDetectorResult
+            det_result = ObjectDetectorResult(
                 file_name=im_path,
                 boxes=merged_boxes,
-                masks=None,  # Masks logic can be added later if needed
                 labels=self.pred_config.labels,
                 threshold=self.threshold,
             )
