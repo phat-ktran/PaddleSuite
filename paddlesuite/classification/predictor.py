@@ -102,8 +102,17 @@ def load_predictor(
 
 
 class ImageClassifier(BasePredictor):
-    def __init__(self, model_dir, device="CPU", cpu_threads=1, enable_mkldnn=False):
+    def __init__(
+        self,
+        model_dir,
+        device="CPU",
+        cpu_threads=1,
+        enable_mkldnn=False,
+        batch_size=None,
+    ):
         self.pred_config = PredictConfig(model_dir)
+        if batch_size is not None:
+            self.pred_config.global_conf["batch_size"] = batch_size
         self.preprocess_ops = create_operators(self.pred_config.preprocess_infos)
         self.postprocess = build_postprocess(self.pred_config.postprocess_conf)
 
@@ -138,27 +147,37 @@ class ImageClassifier(BasePredictor):
         if not image_list:
             return
 
-        for im in image_list:
-            results = self._predict_images([im])
+        batch_size = self.pred_config.global_conf.get("batch_size", 1)
+        for idx in range(0, len(image_list), batch_size):
+            batch_list = image_list[idx : idx + batch_size]
+            results = self._predict_images(batch_list)
             if results:
-                yield results[0]
+                for res in results:
+                    yield res
 
     def _predict_images(self, image_list):
         results = []
-        for im in image_list:
-            # Preprocess
-            data = im
-            if isinstance(im, str):
-                with open(im, "rb") as f:
-                    data = f.read()
+        batch_size = self.pred_config.global_conf.get("batch_size", 1)
 
-            for ops in self.preprocess_ops:
-                data = ops(data)
+        for idx in range(0, len(image_list), batch_size):
+            batch_list = image_list[idx : idx + batch_size]
+            batch_data = []
+
+            for im in batch_list:
+                # Preprocess
+                data = im
+                if isinstance(im, str):
+                    with open(im, "rb") as f:
+                        data = f.read()
+
+                for ops in self.preprocess_ops:
+                    data = ops(data)
+                batch_data.append(data)
 
             # Inference
             input_names = self.predictor.get_input_names()
             input_tensor = self.predictor.get_input_handle(input_names[0])
-            input_tensor.copy_from_cpu(np.array([data]))
+            input_tensor.copy_from_cpu(np.array(batch_data))
 
             self.predictor.run()
 
@@ -169,12 +188,12 @@ class ImageClassifier(BasePredictor):
             # Postprocess
             if self.postprocess is not None:
                 # We pass the image path if available for metadata
-                image_file = [im] if isinstance(im, str) else None
+                image_file = [im if isinstance(im, str) else None for im in batch_list]
                 batch_output = self.postprocess(batch_output, image_file)
 
             if batch_output:
-                results.append(batch_output[0])
+                results.extend(batch_output)
             else:
-                results.append(None)
+                results.extend([None] * len(batch_list))
 
         return results
