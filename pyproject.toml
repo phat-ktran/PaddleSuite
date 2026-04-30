@@ -14,5 +14,6 @@ dependencies = [
     "opencv-python",
     "pillow",
     "tqdm",
-    "setuptools"
+    "setuptools",
+    "faiss-cpu>=1.13.2",
 ]
