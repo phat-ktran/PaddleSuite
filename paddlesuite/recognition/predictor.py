@@ -220,7 +220,14 @@ class ImageRecognizer(BasePredictor):
                 matches = search_results[i] if search_results is not None else []
                 labels = [m["doc"] for m in matches]
                 scores = [m["score"] for m in matches]
-                res = RecognitionResult(labels=labels, scores=scores)
+
+                # Extract file path if provided
+                im = batch_list[i]
+                file_name = im if isinstance(im, str) else None
+
+                res = RecognitionResult(
+                    labels=labels, scores=scores, file_name=file_name
+                )
                 results.append(res)
 
         return results
