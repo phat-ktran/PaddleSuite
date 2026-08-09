@@ -18,6 +18,30 @@ class ObjectDetectorResult:
             self.score = np.array([])
             self.boxes = np.empty((0, 4))
 
+    def __str__(self):
+        prefix = f"{self.file_name}:\t" if self.file_name else ""
+        detections = []
+        for class_id, score, box in zip(self.cls_id, self.score, self.boxes):
+            if score < self.threshold:
+                continue
+
+            class_id = int(class_id)
+            label = (
+                self.labels[class_id]
+                if self.labels is not None and 0 <= class_id < len(self.labels)
+                else str(class_id)
+            )
+            box_str = "[{}]".format(
+                ", ".join("{:.2f}".format(coordinate) for coordinate in box)
+            )
+            detections.append(
+                "class_id: {}, label_name: {}, score: {:.5f}, bbox: {}".format(
+                    class_id, label, score, box_str
+                )
+            )
+
+        return prefix + ("; ".join(detections) if detections else "No objects detected.")
+
     def save_to_json(self, dir_path):
         os.makedirs(dir_path, exist_ok=True)
         img_name = os.path.basename(self.file_name)
