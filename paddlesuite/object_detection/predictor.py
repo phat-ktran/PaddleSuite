@@ -1,11 +1,8 @@
 import os
 import yaml
+import cv2
 import numpy as np
-import math
-import json
-import paddle
-from dataclasses import dataclass
-
+from concurrent.futures import ThreadPoolExecutor
 
 from paddle.inference import Config
 from paddle.inference import create_predictor
@@ -18,94 +15,76 @@ from .preprocess import (
     Permute,
     PadStride,
     Pad,
-    decode_image,
 )
+from paddlesuite.base import BasePredictor
 from .utils import Timer
-from .visualize import visualize_box_mask
 from .result import ObjectDetectorResult
 
 
-def compute_iou(box1, boxes):
-    x1 = np.maximum(box1[:, 0], boxes[:, 0])
-    y1 = np.maximum(box1[:, 1], boxes[:, 1])
-    x2 = np.minimum(box1[:, 2], boxes[:, 2])
-    y2 = np.minimum(box1[:, 3], boxes[:, 3])
+PREPROCESS_OPERATORS = {
+    operator.__name__: operator
+    for operator in (
+        MultiscaleTestResize,
+        Resize,
+        NormalizeImage,
+        Permute,
+        PadStride,
+        Pad,
+    )
+}
 
-    intersection = np.maximum(x2 - x1, 0) * np.maximum(y2 - y1, 0)
-    area1 = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])
-    area2 = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
 
-    return intersection / (area1 + area2 - intersection)
-
-
-def multiclass_nms(bboxes, num_classes=80, nms_threshold=0.5, score_threshold=0.01):
+def nms(bboxes, nms_threshold=0.5, score_threshold=0.01):
     if len(bboxes) == 0:
         return np.empty((0, 6), dtype=np.float32)
 
-    keep_boxes = []
-    for class_id in range(num_classes):
-        class_indices = np.where(bboxes[:, 0] == class_id)[0]
-        if len(class_indices) == 0:
-            continue
-
-        class_boxes = bboxes[class_indices]
-        class_scores = class_boxes[:, 1]
-
-        score_mask = class_scores > score_threshold
-        class_boxes = class_boxes[score_mask]
-
-        if len(class_boxes) == 0:
-            continue
-
-        order = class_boxes[:, 1].argsort()[::-1]
-        class_boxes = class_boxes[order]
-
-        keep = []
-        while class_boxes.shape[0] > 0:
-            keep.append(class_boxes[0])
-            if class_boxes.shape[0] == 1:
-                break
-
-            ious = compute_iou(class_boxes[0:1, 2:], class_boxes[1:, 2:])
-            class_boxes = class_boxes[1:][ious < nms_threshold]
-
-        keep_boxes.extend(keep)
-
-    if len(keep_boxes) == 0:
+    boxes = bboxes[bboxes[:, 1] > score_threshold]
+    if len(boxes) == 0:
         return np.empty((0, 6), dtype=np.float32)
 
-    return np.array(keep_boxes)
+    xywh_boxes = boxes[:, 2:6].copy()
+    xywh_boxes[:, 2:4] -= xywh_boxes[:, 0:2]
+    keep_indices = cv2.dnn.NMSBoxes(
+        xywh_boxes,
+        boxes[:, 1],
+        score_threshold,
+        nms_threshold,
+    )
+    if len(keep_indices) == 0:
+        return np.empty((0, 6), dtype=np.float32)
+
+    kept = boxes[np.asarray(keep_indices).reshape(-1)]
+    return kept[kept[:, 1].argsort()[::-1]]
 
 
 def create_inputs(imgs, im_info):
     inputs = {}
-    im_shape = []
-    scale_factor = []
     if len(imgs) == 1:
-        inputs["image"] = np.array((imgs[0],)).astype("float32")
-        inputs["im_shape"] = np.array((im_info[0]["im_shape"],)).astype("float32")
-        inputs["scale_factor"] = np.array((im_info[0]["scale_factor"],)).astype(
-            "float32"
+        inputs["image"] = np.expand_dims(np.asarray(imgs[0], dtype=np.float32), axis=0)
+        inputs["im_shape"] = np.expand_dims(
+            np.asarray(im_info[0]["im_shape"], dtype=np.float32), axis=0
+        )
+        inputs["scale_factor"] = np.expand_dims(
+            np.asarray(im_info[0]["scale_factor"], dtype=np.float32), axis=0
         )
         return inputs
 
-    for e in im_info:
-        im_shape.append(np.array((e["im_shape"],)).astype("float32"))
-        scale_factor.append(np.array((e["scale_factor"],)).astype("float32"))
-
-    inputs["im_shape"] = np.concatenate(im_shape, axis=0)
-    inputs["scale_factor"] = np.concatenate(scale_factor, axis=0)
+    inputs["im_shape"] = np.asarray([e["im_shape"] for e in im_info], dtype=np.float32)
+    inputs["scale_factor"] = np.asarray(
+        [e["scale_factor"] for e in im_info], dtype=np.float32
+    )
 
     imgs_shape = [[e.shape[1], e.shape[2]] for e in imgs]
     max_shape_h = max([e[0] for e in imgs_shape])
     max_shape_w = max([e[1] for e in imgs_shape])
-    padding_imgs = []
-    for img in imgs:
+    batch = np.zeros(
+        (len(imgs), imgs[0].shape[0], max_shape_h, max_shape_w),
+        dtype=np.float32,
+    )
+    for image_idx, img in enumerate(imgs):
         im_c, im_h, im_w = img.shape[:]
-        padding_im = np.zeros((im_c, max_shape_h, max_shape_w), dtype=np.float32)
-        padding_im[:, :im_h, :im_w] = img
-        padding_imgs.append(padding_im)
-    inputs["image"] = np.stack(padding_imgs, axis=0)
+        batch[image_idx, :im_c, :im_h, :im_w] = img
+    inputs["image"] = batch
     return inputs
 
 
@@ -213,7 +192,7 @@ def load_predictor(
                 config.enable_mkldnn()
                 if enable_mkldnn_bfloat16:
                     config.enable_mkldnn_bfloat16()
-            except Exception as e:
+            except Exception:
                 print(
                     "The current environment does not support `mkldnn`, so disable mkldnn."
                 )
@@ -244,9 +223,6 @@ def get_files(path):
     return None
 
 
-from paddlesuite.base import BasePredictor
-
-
 class ObjectDetector(BasePredictor):
     def __init__(
         self,
@@ -263,8 +239,12 @@ class ObjectDetector(BasePredictor):
         threshold=0.5,
         delete_shuffle_pass=False,
         use_fd_format=False,
+        workers=1,
     ):
+        self._validate_workers(workers)
+        self.workers = workers
         self.pred_config = self.set_config(model_dir, use_fd_format=use_fd_format)
+        self.preprocess_ops = self._create_preprocess_ops()
         self.predictor, self.config = load_predictor(
             model_dir,
             self.pred_config.arch,
@@ -285,31 +265,54 @@ class ObjectDetector(BasePredictor):
         self.det_times = Timer()
         self.threshold = threshold
         self.device = device
+        self._executor = (
+            ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="paddlesuite-object-detector",
+            )
+            if workers > 1
+            else None
+        )
 
     def set_config(self, model_dir, use_fd_format):
         return PredictConfig(model_dir, use_fd_format=use_fd_format)
 
-    def preprocess(self, image_list):
+    def _create_preprocess_ops(self):
         preprocess_ops = []
         for op_info in self.pred_config.preprocess_infos:
             new_op_info = op_info.copy()
             op_type = new_op_info.pop("type")
-            preprocess_ops.append(eval(op_type)(**new_op_info))
+            operator = PREPROCESS_OPERATORS.get(op_type)
+            if operator is None:
+                raise ValueError(f"Unsupported preprocess operator: {op_type}")
+            preprocess_ops.append(operator(**new_op_info))
+        return preprocess_ops
+
+    def _parallel_map(self, function, items):
+        if self._executor is None or len(items) < 2:
+            return [function(item) for item in items]
+        return list(self._executor.map(function, items))
+
+    def _run_preprocess(self, image):
+        return preprocess(image, self.preprocess_ops)
+
+    def _preprocess_one(self, image):
+        im_scales, info_scales = self._run_preprocess(image)
+        if not isinstance(im_scales, list):
+            im_scales = [im_scales]
+            info_scales = [info_scales]
 
         inputs_list = []
-        for im_path in image_list:
-            im_scales, info_scales = preprocess(im_path, preprocess_ops)
-
-            if not isinstance(im_scales, list):
-                im_scales = [im_scales]
-                info_scales = [info_scales]
-
-            for im, im_info in zip(im_scales, info_scales):
-                inputs = create_inputs([im], [im_info])
-                inputs["is_flipped"] = im_info.get("is_flipped", False)
-                inputs_list.append(inputs)
+        for im, im_info in zip(im_scales, info_scales):
+            inputs = create_inputs([im], [im_info])
+            inputs["is_flipped"] = im_info.get("is_flipped", False)
+            inputs_list.append(inputs)
 
         return inputs_list
+
+    def preprocess(self, image_list):
+        per_image_inputs = self._parallel_map(self._preprocess_one, image_list)
+        return [inputs for image_inputs in per_image_inputs for inputs in image_inputs]
 
     def postprocess(self, inputs, result):
         np_boxes_num = result["boxes_num"]
@@ -371,30 +374,50 @@ class ObjectDetector(BasePredictor):
         if batch_size <= 0:
             raise ValueError("`batch_size` must be greater than 0")
 
+    @staticmethod
+    def _validate_workers(workers):
+        if isinstance(workers, bool) or not isinstance(workers, int):
+            raise TypeError("`workers` must be an integer")
+        if workers <= 0:
+            raise ValueError("`workers` must be greater than 0")
+
     def _preprocess_batch(self, image_list):
-        per_image_inputs = [self.preprocess([image]) for image in image_list]
-        scale_counts = {len(inputs) for inputs in per_image_inputs}
+        per_image_scales = self._parallel_map(self._run_preprocess, image_list)
+        scale_counts = {len(images) for images, _ in per_image_scales}
         if len(scale_counts) != 1:
-            raise ValueError("All images in a batch must have the same number of scales")
+            raise ValueError(
+                "All images in a batch must have the same number of scales"
+            )
 
         inputs_list = []
         for scale_idx in range(scale_counts.pop()):
-            scale_inputs = [inputs[scale_idx] for inputs in per_image_inputs]
-            images = [inputs["image"][0] for inputs in scale_inputs]
-            im_info = [
-                {
-                    "im_shape": inputs["im_shape"][0],
-                    "scale_factor": inputs["scale_factor"][0],
-                }
-                for inputs in scale_inputs
-            ]
+            images = [images[scale_idx] for images, _ in per_image_scales]
+            im_info = [infos[scale_idx] for _, infos in per_image_scales]
             batch_inputs = create_inputs(images, im_info)
             batch_inputs["is_flipped"] = [
-                inputs.get("is_flipped", False) for inputs in scale_inputs
+                info.get("is_flipped", False) for info in im_info
             ]
             inputs_list.append(batch_inputs)
 
         return inputs_list
+
+    def _postprocess_image(self, item):
+        im_path, image_boxes = item
+        if image_boxes:
+            concatenated_boxes = np.concatenate(image_boxes)
+            merged_boxes = nms(
+                concatenated_boxes,
+                nms_threshold=0.5,
+            )
+        else:
+            merged_boxes = np.empty((0, 6), dtype=np.float32)
+
+        return ObjectDetectorResult(
+            file_name=im_path,
+            boxes=merged_boxes,
+            labels=self.pred_config.labels,
+            threshold=self.threshold,
+        )
 
     def _predict_images(self, image_list, batch_size=1):
         self._validate_batch_size(batch_size)
@@ -449,27 +472,12 @@ class ObjectDetector(BasePredictor):
                     all_boxes[image_idx].append(np_boxes)
 
             self.det_times.postprocess_time_s.start()
-            for im_path, image_boxes in zip(batch_list, all_boxes):
-                if image_boxes:
-                    concatenated_boxes = np.concatenate(image_boxes)
-                    # Pass the number of classes from labels
-                    merged_boxes = multiclass_nms(
-                        concatenated_boxes,
-                        num_classes=len(self.pred_config.labels),
-                        nms_threshold=0.5,
-                    )
-                else:
-                    merged_boxes = np.empty((0, 6), dtype=np.float32)
-
-                # Create the ObjectDetectorResult
-                det_result = ObjectDetectorResult(
-                    file_name=im_path,
-                    boxes=merged_boxes,
-                    labels=self.pred_config.labels,
-                    threshold=self.threshold,
+            results.extend(
+                self._parallel_map(
+                    self._postprocess_image,
+                    list(zip(batch_list, all_boxes)),
                 )
-
-                results.append(det_result)
+            )
 
             self.det_times.postprocess_time_s.end()
             self.det_times.img_num += len(batch_list)
