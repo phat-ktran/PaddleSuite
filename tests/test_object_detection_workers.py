@@ -32,6 +32,41 @@ def make_detector(workers):
 
 
 class ObjectDetectorWorkersTest(unittest.TestCase):
+    def test_close_releases_executor_and_predictor(self):
+        class FakeExecutor:
+            def __init__(self):
+                self.shutdown_args = None
+
+            def shutdown(self, **kwargs):
+                self.shutdown_args = kwargs
+
+        class FakePredictor:
+            def __init__(self):
+                self.cleared = False
+
+            def clear_intermediate_tensor(self):
+                self.cleared = True
+
+        detector = ObjectDetector.__new__(ObjectDetector)
+        executor = FakeExecutor()
+        predictor = FakePredictor()
+        detector._closed = False
+        detector._executor = executor
+        detector.predictor = predictor
+        detector.config = object()
+
+        detector.close()
+        detector.close()
+
+        self.assertTrue(detector._closed)
+        self.assertIsNone(detector._executor)
+        self.assertIsNone(detector.predictor)
+        self.assertIsNone(detector.config)
+        self.assertTrue(predictor.cleared)
+        self.assertEqual(executor.shutdown_args, {"wait": True, "cancel_futures": True})
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            detector._ensure_open()
+
     def test_workers_validation(self):
         for workers in (1, 4):
             ObjectDetector._validate_workers(workers)

@@ -1,6 +1,7 @@
 import os
 import yaml
 import cv2
+import gc
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 
@@ -265,6 +266,7 @@ class ObjectDetector(BasePredictor):
         self.det_times = Timer()
         self.threshold = threshold
         self.device = device
+        self._closed = False
         self._executor = (
             ThreadPoolExecutor(
                 max_workers=workers,
@@ -273,6 +275,43 @@ class ObjectDetector(BasePredictor):
             if workers > 1
             else None
         )
+
+    def close(self):
+        """Release preprocessing workers and native predictor resources."""
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+
+        executor = getattr(self, "_executor", None)
+        self._executor = None
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+        predictor = getattr(self, "predictor", None)
+        self.predictor = None
+        self.config = None
+        if predictor is not None:
+            try:
+                clear_intermediate_tensor = getattr(
+                    predictor, "clear_intermediate_tensor", None
+                )
+                if clear_intermediate_tensor is not None:
+                    clear_intermediate_tensor()
+            finally:
+                del predictor
+        gc.collect()
+
+    def __enter__(self):
+        if getattr(self, "_closed", False):
+            raise RuntimeError("ObjectDetector is closed")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+    def _ensure_open(self):
+        if getattr(self, "_closed", False):
+            raise RuntimeError("ObjectDetector is closed")
 
     def set_config(self, model_dir, use_fd_format):
         return PredictConfig(model_dir, use_fd_format=use_fd_format)
@@ -342,6 +381,7 @@ class ObjectDetector(BasePredictor):
         return result
 
     def predict(self, data, batch_size=1):
+        self._ensure_open()
         self._validate_batch_size(batch_size)
         if isinstance(data, str):
             image_list = get_files(data)
@@ -352,6 +392,7 @@ class ObjectDetector(BasePredictor):
         return self._predict_images(image_list, batch_size=batch_size)
 
     def predict_iter(self, data, batch_size=1):
+        self._ensure_open()
         self._validate_batch_size(batch_size)
         if isinstance(data, str):
             image_list = get_files(data)
