@@ -7,8 +7,8 @@ import numpy as np
 from paddlesuite.object_detection.predictor import (
     ObjectDetector,
     create_inputs,
-    nms,
 )
+from paddlesuite.object_detection.postprocess import nms
 from paddlesuite.object_detection.preprocess import NormalizeImage, Permute, Resize
 
 
@@ -32,6 +32,24 @@ def make_detector(workers):
 
 
 class ObjectDetectorWorkersTest(unittest.TestCase):
+    def test_raw_iterator_skips_cpu_postprocessing(self):
+        detector = ObjectDetector.__new__(ObjectDetector)
+        detector._closed = False
+        detector.det_times = SimpleNamespace(img_num=0)
+        inferred_batches = []
+
+        def infer_batch(batch):
+            inferred_batches.append(batch)
+            return [[np.full((1, 6), index, dtype=np.float32)] for index in batch]
+
+        detector._infer_batch = infer_batch
+
+        results = list(detector.predict_raw_iter([0, 1, 2], batch_size=2))
+
+        self.assertEqual(inferred_batches, [[0, 1], [2]])
+        self.assertEqual([item[0] for item in results], [0, 1, 2])
+        self.assertEqual(detector.det_times.img_num, 3)
+
     def test_close_releases_executor_and_predictor(self):
         class FakeExecutor:
             def __init__(self):

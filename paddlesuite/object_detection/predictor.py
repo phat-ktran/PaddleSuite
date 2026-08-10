@@ -1,6 +1,5 @@
 import os
 import yaml
-import cv2
 import gc
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
@@ -18,6 +17,7 @@ from .preprocess import (
     Pad,
 )
 from paddlesuite.base import BasePredictor
+from .postprocess import merge_scale_boxes
 from .utils import Timer
 from .result import ObjectDetectorResult
 
@@ -33,29 +33,6 @@ PREPROCESS_OPERATORS = {
         Pad,
     )
 }
-
-
-def nms(bboxes, nms_threshold=0.5, score_threshold=0.01):
-    if len(bboxes) == 0:
-        return np.empty((0, 6), dtype=np.float32)
-
-    boxes = bboxes[bboxes[:, 1] > score_threshold]
-    if len(boxes) == 0:
-        return np.empty((0, 6), dtype=np.float32)
-
-    xywh_boxes = boxes[:, 2:6].copy()
-    xywh_boxes[:, 2:4] -= xywh_boxes[:, 0:2]
-    keep_indices = cv2.dnn.NMSBoxes(
-        xywh_boxes,
-        boxes[:, 1],
-        score_threshold,
-        nms_threshold,
-    )
-    if len(keep_indices) == 0:
-        return np.empty((0, 6), dtype=np.float32)
-
-    kept = boxes[np.asarray(keep_indices).reshape(-1)]
-    return kept[kept[:, 1].argsort()[::-1]]
 
 
 def create_inputs(imgs, im_info):
@@ -408,6 +385,23 @@ class ObjectDetector(BasePredictor):
             for res in results:
                 yield res
 
+    def predict_raw_iter(self, data, batch_size=1):
+        """Yield raw per-image scale outputs without CPU NMS/result construction."""
+        self._ensure_open()
+        self._validate_batch_size(batch_size)
+        if isinstance(data, str):
+            image_list = get_files(data)
+        else:
+            image_list = data
+        if not image_list:
+            return
+
+        for idx in range(0, len(image_list), batch_size):
+            batch_list = image_list[idx : idx + batch_size]
+            all_boxes = self._infer_batch(batch_list)
+            self.det_times.img_num += len(batch_list)
+            yield from zip(batch_list, all_boxes)
+
     @staticmethod
     def _validate_batch_size(batch_size):
         if isinstance(batch_size, bool) or not isinstance(batch_size, int):
@@ -444,14 +438,7 @@ class ObjectDetector(BasePredictor):
 
     def _postprocess_image(self, item):
         im_path, image_boxes = item
-        if image_boxes:
-            concatenated_boxes = np.concatenate(image_boxes)
-            merged_boxes = nms(
-                concatenated_boxes,
-                nms_threshold=0.5,
-            )
-        else:
-            merged_boxes = np.empty((0, 6), dtype=np.float32)
+        merged_boxes = merge_scale_boxes(image_boxes, nms_threshold=0.5)
 
         return ObjectDetectorResult(
             file_name=im_path,
@@ -460,57 +447,60 @@ class ObjectDetector(BasePredictor):
             threshold=self.threshold,
         )
 
+    def _infer_batch(self, batch_list):
+        self.det_times.preprocess_time_s.start()
+        inputs_list = self._preprocess_batch(batch_list)
+        self.det_times.preprocess_time_s.end()
+
+        all_boxes = [[] for _ in batch_list]
+        for inputs in inputs_list:
+            self.det_times.inference_time_s.start()
+            input_names = self.predictor.get_input_names()
+            for input_name in input_names:
+                input_tensor = self.predictor.get_input_handle(input_name)
+                if input_name == "x":
+                    input_tensor.copy_from_cpu(inputs["image"])
+                else:
+                    input_tensor.copy_from_cpu(inputs[input_name])
+
+            result = self._predict()
+            self.det_times.inference_time_s.end()
+
+            scale_result = self.postprocess(inputs, result)
+            boxes = scale_result.get("boxes")
+            boxes_num = np.asarray(scale_result["boxes_num"]).reshape(-1)
+            if len(boxes_num) != len(batch_list):
+                raise RuntimeError(
+                    "The detector did not return `boxes_num` for every image in the batch"
+                )
+
+            box_offset = 0
+            for image_idx, box_count in enumerate(boxes_num.astype(int)):
+                np_boxes = boxes[box_offset : box_offset + box_count]
+                box_offset += box_count
+                if len(np_boxes) == 0:
+                    continue
+
+                if inputs["is_flipped"][image_idx]:
+                    orig_w = (
+                        inputs["im_shape"][image_idx][1]
+                        / inputs["scale_factor"][image_idx][1]
+                    )
+                    xmin = orig_w - np_boxes[:, 4]
+                    xmax = orig_w - np_boxes[:, 2]
+                    np_boxes[:, 2] = xmin
+                    np_boxes[:, 4] = xmax
+
+                all_boxes[image_idx].append(np_boxes)
+
+        return all_boxes
+
     def _predict_images(self, image_list, batch_size=1):
         self._validate_batch_size(batch_size)
         results = []
         for idx in range(0, len(image_list), batch_size):
             batch_list = image_list[idx : idx + batch_size]
-            self.det_times.preprocess_time_s.start()
-            inputs_list = self._preprocess_batch(batch_list)
-            self.det_times.preprocess_time_s.end()
-
-            all_boxes = [[] for _ in batch_list]
-
-            for inputs in inputs_list:
-                self.det_times.inference_time_s.start()
-                input_names = self.predictor.get_input_names()
-                for j in range(len(input_names)):
-                    input_tensor = self.predictor.get_input_handle(input_names[j])
-                    if input_names[j] == "x":
-                        input_tensor.copy_from_cpu(inputs["image"])
-                    else:
-                        input_tensor.copy_from_cpu(inputs[input_names[j]])
-
-                result = self._predict()
-                self.det_times.inference_time_s.end()
-
-                scale_result = self.postprocess(inputs, result)
-                boxes = scale_result.get("boxes")
-                boxes_num = np.asarray(scale_result["boxes_num"]).reshape(-1)
-                if len(boxes_num) != len(batch_list):
-                    raise RuntimeError(
-                        "The detector did not return `boxes_num` for every image "
-                        "in the batch"
-                    )
-
-                box_offset = 0
-                for image_idx, box_count in enumerate(boxes_num.astype(int)):
-                    np_boxes = boxes[box_offset : box_offset + box_count]
-                    box_offset += box_count
-                    if len(np_boxes) == 0:
-                        continue
-
-                    if inputs["is_flipped"][image_idx]:
-                        orig_w = (
-                            inputs["im_shape"][image_idx][1]
-                            / inputs["scale_factor"][image_idx][1]
-                        )
-                        xmin = orig_w - np_boxes[:, 4]
-                        xmax = orig_w - np_boxes[:, 2]
-                        np_boxes[:, 2] = xmin
-                        np_boxes[:, 4] = xmax
-
-                    all_boxes[image_idx].append(np_boxes)
+            all_boxes = self._infer_batch(batch_list)
 
             self.det_times.postprocess_time_s.start()
             results.extend(
