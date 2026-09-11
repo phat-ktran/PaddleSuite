@@ -16,6 +16,7 @@ import yaml
 import numpy as np
 import cv2
 import paddle
+from PIL import Image
 from paddle.inference import Config
 from paddle.inference import create_predictor
 
@@ -169,6 +170,12 @@ class ImageClassifier(BasePredictor):
                 if isinstance(im, str):
                     with open(im, "rb") as f:
                         data = f.read()
+                elif isinstance(im, Image.Image):
+                    # DecodeImage normally converts byte input to an RGB NumPy
+                    # array.  Do the equivalent conversion for in-memory
+                    # Pillow images so every subsequent operator receives the
+                    # same representation as it does for file paths.
+                    data = np.asarray(im.convert("RGB"))
 
                 for ops in self.preprocess_ops:
                     data = ops(data)

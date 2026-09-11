@@ -128,6 +128,19 @@ class DecodeImage(object):
         self.channel_first = channel_first  # only enabled when to_np is True
 
     def __call__(self, img):
+        if isinstance(img, np.ndarray):
+            if self.channel_first:
+                img = img.transpose((2, 0, 1))
+            return img
+
+        if isinstance(img, Image.Image):
+            if self.to_rgb:
+                img = img.convert("RGB")
+            img = np.asarray(img)
+            if self.channel_first:
+                img = img.transpose((2, 0, 1))
+            return img
+
         if six.PY2:
             assert type(img) is str and len(
                 img) > 0, "invalid input 'img' in DecodeImage"
@@ -155,7 +168,8 @@ class ResizeImage(object):
                  resize_short=None,
                  interpolation=None,
                  backend="cv2",
-                 return_numpy=True):
+                 return_numpy=True,
+                 padded=False):
         if resize_short is not None and resize_short > 0:
             self.resize_short = resize_short
             self.w = None
@@ -172,6 +186,28 @@ class ResizeImage(object):
             interpolation=interpolation,
             backend=backend,
             return_numpy=return_numpy)
+        self.return_numpy = return_numpy
+        self.padded = padded
+
+    def _pad_image(self, img, width, height):
+        """Center ``img`` on a white canvas of ``(width, height)``."""
+        if isinstance(img, np.ndarray):
+            if img.ndim == 2:
+                canvas_shape = (height, width)
+            else:
+                canvas_shape = (height, width) + img.shape[2:]
+            canvas = np.full(canvas_shape, 255, dtype=img.dtype)
+            img_h, img_w = img.shape[:2]
+            top = (height - img_h) // 2
+            left = (width - img_w) // 2
+            canvas[top:top + img_h, left:left + img_w, ...] = img
+            return canvas
+
+        canvas = Image.new(img.mode, (width, height), color="white")
+        left = (width - img.width) // 2
+        top = (height - img.height) // 2
+        canvas.paste(img, (left, top))
+        return np.asarray(canvas) if self.return_numpy else canvas
 
     def __call__(self, img):
         if isinstance(img, np.ndarray):
@@ -188,7 +224,58 @@ class ResizeImage(object):
         else:
             w = self.w
             h = self.h
+
+        # Padding preserves small images at their original scale.  Images that
+        # do not fit the requested canvas keep the existing resize behavior.
+        if (self.padded and self.resize_short is None and img_w <= w
+                and img_h <= h and max(img_w, img_h) < max(w, h)):
+            return self._pad_image(img, w, h)
         return self._resize_func(img, (w, h))
+
+
+class RandomGrayscale(object):
+    """Convert an image to grayscale with probability ``p``.
+
+    Three-channel images remain three-channel after conversion so they are
+    compatible with classification models trained on RGB input.
+    """
+
+    def __init__(self, p=0.1):
+        self.p = p
+
+    def __call__(self, img):
+        if isinstance(img, np.ndarray):
+            num_output_channels = 1 if img.ndim == 2 else img.shape[2]
+        elif isinstance(img, Image.Image):
+            num_output_channels = len(img.getbands())
+        else:
+            raise TypeError("RandomGrayscale expects a NumPy or Pillow image")
+
+        if np.random.rand() >= self.p:
+            return img
+
+        if num_output_channels not in (1, 3):
+            raise ValueError("num_output_channels should be either 1 or 3")
+
+        is_pil_image = isinstance(img, Image.Image)
+        if not is_pil_image:
+            img = Image.fromarray(np.ascontiguousarray(img))
+
+        gray = img.convert("L")
+        if num_output_channels == 3:
+            gray_array = np.asarray(gray, dtype=np.uint8)
+            gray = Image.fromarray(np.dstack([gray_array] * 3), "RGB")
+
+        if is_pil_image:
+            return gray
+        return np.asarray(gray, dtype=np.uint8)
+
+
+class Grayscale(RandomGrayscale):
+    """Always convert an image to grayscale while preserving its channels."""
+
+    def __init__(self, p=1.0):
+        super(Grayscale, self).__init__(p=p)
 
 
 class CropImage(object):
